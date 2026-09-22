@@ -1,0 +1,12 @@
+#!name=节点质量查询（Surge）
+#!desc=多源 IPv4 风险查询。默认遵循当前分流规则，可通过脚本 argument 指定 policy。
+#!author=Roddy-D / Surge conversion
+#!homepage=https://github.com/Roddy-D/Loon_plugins
+#!icon=https://raw.githubusercontent.com/Roddy-D/Loon_plugins/main/icon/iptest.png
+#!updateDate=2026-09-22
+
+[Panel]
+IPQuality = title="IP 风险查询", content="尚未查询", script-name=IPQuality
+
+[Script]
+IPQuality = type=generic, script-path=https://raw.githubusercontent.com/tiuunf/surge-/main/iptest-surge.js, timeout=60

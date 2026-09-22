@@ -1,0 +1,137 @@
+name: Sync upstream Loon IP test
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-iptest
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and convert upstream script
+        shell: python
+        run: |
+          import pathlib, re, urllib.request
+
+          url = "https://raw.githubusercontent.com/Roddy-D/Loon_plugins/refs/heads/main/script/iptest.js"
+          req = urllib.request.Request(url, headers={"User-Agent": "surge-upstream-sync"})
+          source = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
+
+          header = '''const IPPURE_URL = "https://my.ippure.com/v1/info";
+          const IPV4_API = "http://ip-api.com/json?lang=zh-CN";
+          const IPAPI_IS_URL = "https://api.ipapi.is/";
+           
+          // 从环境参数获取节点名
+          const nodeName = $environment.params.node;
+          const maskIP = $persistentStore.read("MaskIP") === "true";'''
+          if header not in source:
+              raise SystemExit("Upstream header changed; refusing to overwrite the working Surge script")
+
+          # Rename upstream completion calls before injecting the Surge adapter.
+          source = source.replace("$done(", "loonDone(")
+          adapter = r'''const IPPURE_URL = "https://my.ippure.com/v1/info";
+          const IPV4_API = "http://ip-api.com/json?lang=zh-CN";
+          const IPAPI_IS_URL = "https://api.ipapi.is/";
+
+          // Surge: argument supports {"policy":"name","maskIP":true}.
+          let surgeOptions = {};
+          try {
+            surgeOptions = JSON.parse(typeof $argument === "string" && $argument ? $argument : "{}");
+            if (!surgeOptions || typeof surgeOptions !== "object") surgeOptions = {};
+          } catch (_) { console.log("argument is not valid JSON; defaults are used"); }
+          const nodeName = typeof surgeOptions.policy === "string" ? surgeOptions.policy.trim() : "";
+          const maskIP = surgeOptions.maskIP === true || surgeOptions.maskIP === "true" || $persistentStore.read("MaskIP") === "true";
+          let surgeFinished = false;
+
+          function validIPv4(value) {
+            if (typeof value !== "string") return null;
+            const ip = value.trim();
+            if (/^(\d{1,3}\.){3}\d{1,3}$/.test(ip) && ip.split(".").every(v => Number(v) <= 255)) return ip;
+            return null;
+          }
+
+          function plainText(value) {
+            return String(value || "")
+              .replace(/<\/?br\s*\/?>/gi, "\n")
+              .replace(/<\/?[^>]+>/g, "")
+              .replace(/&nbsp;/g, " ")
+              .replace(/&amp;/g, "&")
+              .trim();
+          }
+
+          function loonDone(result = {}) {
+            if (surgeFinished) return;
+            surgeFinished = true;
+            const title = result.title || "节点 IP 风险汇总";
+            const content = plainText(result.htmlMessage || result.content || "查询完成");
+            console.log(title + "\n" + content);
+            const panel = typeof $input !== "undefined" && $input && $input.purpose === "panel";
+            if (!panel && typeof $notification !== "undefined") {
+              try { $notification.post(title, "", content); } catch (e) { console.log(String(e)); }
+            }
+            $done({
+              title,
+              content,
+              icon: result.icon || "globe.asia.australia",
+              "icon-color": result["title-color"] || "#34C759"
+            });
+          }'''
+          source = source.replace(header, adapter)
+
+          old_request = '''$httpClient.get({ url, node: nodeName, headers }, (err, resp, data) => {
+                if (err) return reject(err);
+                if (!data) return reject(new Error("empty response"));'''
+          new_request = '''$httpClient.get({ url, headers, timeout: 8, ...(nodeName ? { policy: nodeName } : {}) }, (err, resp, data) => {
+                if (err) return reject(new Error(String(err)));
+                if (!resp || resp.status < 200 || resp.status >= 300) return reject(new Error("HTTP " + (resp && resp.status)));
+                if (!data) return reject(new Error("empty response"));'''
+          if old_request not in source:
+              raise SystemExit("Upstream request code changed; refusing unsafe conversion")
+          source = source.replace(old_request, new_request, 1)
+
+          replacements = {
+              'ip = ipv4Json?.query || ipv4Json?.ip || String(ipv4Data || "").trim();':
+                  'ip = validIPv4(ipv4Json && (ipv4Json.query || ipv4Json.ip));',
+              'ip = cachedIpapiResponse.ip;':
+                  'ip = validIPv4(cachedIpapiResponse.ip);',
+              'if (base) ippureFraudScore = base.fraudScore;':
+                  'if (base && base.ip === ip) ippureFraudScore = base.fraudScore;',
+          }
+          for old, new in replacements.items():
+              if old not in source:
+                  raise SystemExit("Upstream logic changed; refusing unsafe conversion: " + old)
+              source = source.replace(old, new, 1)
+
+          # Prevent null scores from becoming zero-risk scores.
+          source = source.replace(
+              'function toInt(v) {\n  const n = Number(v);',
+              'function toInt(v) {\n  if (v === null || v === undefined || String(v).trim() === "") return null;\n  const n = Number(v);',
+              1,
+          )
+          banner = "// AUTO-GENERATED from Roddy-D/Loon_plugins by .github/workflows/sync-upstream.yml\n"
+          pathlib.Path("iptest-surge.js").write_text(banner + source, encoding="utf-8")
+
+      - name: Validate generated JavaScript
+        run: node --check iptest-surge.js
+
+      - name: Commit upstream changes
+        run: |
+          if git diff --quiet -- iptest-surge.js; then
+            echo "Already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add iptest-surge.js
+          git commit -m "Sync and convert upstream iptest.js"
+          git push

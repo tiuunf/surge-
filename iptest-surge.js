@@ -1,16 +1,51 @@
+// AUTO-GENERATED from Roddy-D/Loon_plugins by .github/workflows/sync-upstream.yml
 const IPPURE_URL = "https://my.ippure.com/v1/info";
 const IPV4_API = "http://ip-api.com/json?lang=zh-CN";
 const IPAPI_IS_URL = "https://api.ipapi.is/";
- 
-// policy 可填写 Surge 中已有的节点或策略组名称；留空遵循当前分流规则。
-let options = {};
+
+// Surge: argument supports {"policy":"name","maskIP":true}.
+let surgeOptions = {};
 try {
-  options = JSON.parse(typeof $argument === "string" && $argument ? $argument : "{}");
-  if (!options || typeof options !== "object") options = {};
-} catch (_) { console.log("argument 不是有效 JSON，使用默认配置"); }
-const policy = typeof options.policy === "string" ? options.policy.trim() : "";
-const nodeName = policy || "当前分流规则（不保证走代理）";
-const maskIP = options.maskIP === true || options.maskIP === "true";
+  surgeOptions = JSON.parse(typeof $argument === "string" && $argument ? $argument : "{}");
+  if (!surgeOptions || typeof surgeOptions !== "object") surgeOptions = {};
+} catch (_) { console.log("argument is not valid JSON; defaults are used"); }
+const nodeName = typeof surgeOptions.policy === "string" ? surgeOptions.policy.trim() : "";
+const maskIP = surgeOptions.maskIP === true || surgeOptions.maskIP === "true" || $persistentStore.read("MaskIP") === "true";
+let surgeFinished = false;
+
+function validIPv4(value) {
+  if (typeof value !== "string") return null;
+  const ip = value.trim();
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(ip) && ip.split(".").every(v => Number(v) <= 255)) return ip;
+  return null;
+}
+
+function plainText(value) {
+  return String(value || "")
+    .replace(/<\/?br\s*\/?>/gi, "\n")
+    .replace(/<\/?[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .trim();
+}
+
+function loonDone(result = {}) {
+  if (surgeFinished) return;
+  surgeFinished = true;
+  const title = result.title || "节点 IP 风险汇总";
+  const content = plainText(result.htmlMessage || result.content || "查询完成");
+  console.log(title + "\n" + content);
+  const panel = typeof $input !== "undefined" && $input && $input.purpose === "panel";
+  if (!panel && typeof $notification !== "undefined") {
+    try { $notification.post(title, "", content); } catch (e) { console.log(String(e)); }
+  }
+  $done({
+    title,
+    content,
+    icon: result.icon || "globe.asia.australia",
+    "icon-color": result["title-color"] || "#34C759"
+  });
+}
 
 // 掩码函数
 function maskIpAddress(ip) {
@@ -32,13 +67,9 @@ function maskIpAddress(ip) {
 
 function httpGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
-    const request = { url, headers, timeout: 8 };
-    if (policy) request.policy = policy;
-    $httpClient.get(request, (err, resp, data) => {
+    $httpClient.get({ url, headers, timeout: 8, ...(nodeName ? { policy: nodeName } : {}) }, (err, resp, data) => {
       if (err) return reject(new Error(String(err)));
-      if (!resp || resp.status < 200 || resp.status >= 300) {
-        return reject(new Error("HTTP " + (resp && resp.status)));
-      }
+      if (!resp || resp.status < 200 || resp.status >= 300) return reject(new Error("HTTP " + (resp && resp.status)));
       if (!data) return reject(new Error("empty response"));
       resolve({ resp, data });
     });
@@ -373,26 +404,6 @@ async function fetchIpinfoIo(ip) {
   return { detected, asnType };
 }
 
-let finished = false;
-function notify(title, body) {
-  if (finished) return;
-  finished = true;
-  const text = String(body || "").replace(/<\/?br\s*\/?>/gi, "\n").replace(/<\/?[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").trim();
-  console.log(title + "\n" + text);
-  const isPanel = typeof $input !== "undefined" && $input && $input.purpose === "panel";
-  if (!isPanel && typeof $notification !== "undefined") {
-    try { $notification.post(title, "", text); } catch (e) { console.log(String(e)); }
-  }
-  $done({ title, content: text, icon: "globe.asia.australia" });
-}
-
-function validIP(value) {
-  if (typeof value !== "string") return null;
-  const ip = value.trim();
-  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(ip) && ip.split(".").every(v => Number(v) <= 255)) return ip;
-  return null;
-}
-
 // ========== 主逻辑 ==========
 
 (async () => {
@@ -402,21 +413,21 @@ function validIP(value) {
   try {
     const { data: ipv4Data } = await httpGet(IPV4_API);
     const ipv4Json = safeJsonParse(ipv4Data);
-    ip = validIP(ipv4Json && (ipv4Json.query || ipv4Json.ip));
+    ip = validIPv4(ipv4Json && (ipv4Json.query || ipv4Json.ip));
   } catch (_) { }
 
   if (!ip) {
     try {
       const { data } = await httpGet(IPAPI_IS_URL);
       cachedIpapiResponse = safeJsonParse(data);
-      if (cachedIpapiResponse) {
-        ip = validIP(cachedIpapiResponse.ip);
+      if (cachedIpapiResponse && cachedIpapiResponse.ip) {
+        ip = validIPv4(cachedIpapiResponse.ip);
       }
     } catch (_) { }
   }
 
   if (!ip) {
-    notify("IP 纯净度", "获取 IPv4 失败");
+    loonDone({ title: "IP 纯净度", content: "获取 IPv4 失败", icon: "exclamationmark.triangle.fill" });
     return;
   }
 
@@ -579,9 +590,18 @@ function validIP(value) {
   html += `</br><font color=#6959CD><b>节点</b> ➟ ${nodeName || "-"}</font>`;
   html += `</p>`;
 
-  notify("节点 IP 风险汇总", html);
+  loonDone({
+    title: "节点 IP 风险汇总",
+    htmlMessage: html,
+    icon: meta.icon,
+    "title-color": meta.color,
+  });
 })().catch((e) => {
   const errHtml = `<p style="text-align: center; font-family: -apple-system; font-size: large; font-weight: bold;">` +
     `</br></br>🔴 请求失败：${String(e && e.message ? e.message : e)}</p>`;
-  notify("IP 纯净度", errHtml);
+  loonDone({
+    title: "IP 纯净度",
+    htmlMessage: errHtml,
+    icon: "network.slash",
+  });
 });
